@@ -497,12 +497,15 @@ class View
         }
 
         // Обработка {% include "file.html" with {var: val} %}
-        $content = preg_replace_callback('/\{%\s*include\s+[\'"](.+?)[\'"]\s*(?:with\s+(\{.*?}))?\s*%}/s', function ($matches) use (&$dependencies, $depth) {
+        $content = preg_replace_callback('/\{%\s*include\s+[\'"](.+?)[\'"]\s*(?:with\s+(\{[^%]*\}))?\s*%}/s', function ($matches) use (&$dependencies, $depth) {
             if ($depth >= self::MAX_INCLUDE_DEPTH) {
                 throw Template::syntaxError('Превышена максимальная глубина вложенности.');
             }
             $includedTemplate = $matches[1];
             $withBlock = isset($matches[2]) ? trim($matches[2]) : '';
+            if ($withBlock !== '' && !$this->isEnclosedIn($withBlock, '{', '}')) {
+                throw Template::syntaxError('Несбалансированные скобки в блоке with.');
+            }
             $incTemplateFile = $this->templateDir . ltrim($includedTemplate, '/\\');
             $this->assertSafePath($incTemplateFile);
             if (!file_exists($incTemplateFile)) {
@@ -627,9 +630,66 @@ class View
                 . ' ? ' . $this->compileExpression($ternary[1])
                 . ' : ' . $this->compileExpression($ternary[2]) . ')';
         }
-        // Логические операторы (and, or, xor)
-        if (preg_match('/^(.*?)\s+(and|xor|or)\s+(.*)$/i', $expr, $ops)) {
-            return '(' . $this->compileExpression($ops[1]) . ' ' . strtolower($ops[2]) . ' ' . $this->compileExpression($ops[3]) . ')';
+        // Логические операторы (and, or, xor) с учетом строк и скобок
+        $logicalOps = ['and', 'or', 'xor'];
+        $logicalMatch = null;
+
+        // Ищем операторы справа налево (для правильной ассоциативности)
+        $depth = 0;
+        $inString = false;
+        $stringChar = '';
+        $len = strlen($expr);
+
+        for ($i = $len - 1; $i >= 0; $i--) {
+            $ch = $expr[$i];
+
+            if ($inString) {
+                if ($ch === $stringChar && $this->countPrecedingBackslashes($expr, $i) % 2 === 0) {
+                    $inString = false;
+                }
+                continue;
+            }
+
+            if ($ch === '"' || $ch === '\'') {
+                $inString = true;
+                $stringChar = $ch;
+                continue;
+            }
+
+            if ($ch === ')' || $ch === ']' || $ch === '}') {
+                $depth++;
+                continue;
+            }
+            if ($ch === '(' || $ch === '[' || $ch === '{') {
+                $depth--;
+                continue;
+            }
+
+            if ($depth === 0) {
+                foreach ($logicalOps as $op) {
+                    $opLen = strlen($op);
+                    // Проверяем, что это отдельное слово (окружено пробелами)
+                    if ($i >= $opLen - 1 && strncasecmp(substr($expr, $i - $opLen + 1, $opLen), $op, $opLen) === 0) {
+                        $before = $i - $opLen;
+                        $after = $i + 1;
+                        if (($before < 0 || $expr[$before] === ' ' || $expr[$before] === "\t") &&
+                            ($after >= $len || $expr[$after] === ' ' || $expr[$after] === "\t")) {
+                            $logicalMatch = [
+                                substr($expr, 0, $before + 1),
+                                $op,
+                                substr($expr, $after)
+                            ];
+                            break 2;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($logicalMatch !== null) {
+            return '(' . $this->compileExpression(trim($logicalMatch[0]))
+                . ' ' . strtolower($logicalMatch[1]) . ' '
+                . $this->compileExpression(trim($logicalMatch[2])) . ')';
         }
 
         // Операторы сравнения и логические И/ИЛИ
