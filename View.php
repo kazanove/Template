@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace CodeX\Template;
+namespace CodeX;
 
 use CodeX\Exception\Template;
 use DateTimeInterface;
@@ -21,7 +21,6 @@ class View
 {
     // Максимальная глубина вложенности include для защиты от бесконечной рекурсии
     private const int MAX_INCLUDE_DEPTH = 20;
-
     // Кэш realpath для ускорения проверок безопасности путей
     private static array $realpathCache = [];
 
@@ -368,15 +367,17 @@ class View
 
     /**
      * Разбивает арифметическое выражение на операнды и оператор.
-     * Соблюдает приоритет операций (+ и - имеют меньший приоритет, чем *, /).
+     * Соблюдает приоритет операций и левоассоциативность.
+     * Поддерживает оператор конкатенации ~ (аналог Twig).
      */
     private function splitByArithmetic(string $expr): ?array
     {
         $depth = 0;
         $lastPlusMinusPos = -1;
         $lastMulDivPos = -1;
+        $lastConcatPos = -1;
 
-        $this->iterateString($expr, function ($ch, $i, $inString) use ($expr, &$depth, &$lastPlusMinusPos, &$lastMulDivPos) {
+        $this->iterateString($expr, function ($ch, $i, $inString) use ($expr, &$depth, &$lastPlusMinusPos, &$lastMulDivPos, &$lastConcatPos) {
             if ($inString) {
                 return false;
             }
@@ -397,7 +398,7 @@ class View
                         break;
                     }
                 }
-                if (in_array($prevNonSpace, ['(', ',', '+', '-', '*', '/', '%', '=', '>', '<', '!'], true)) {
+                if (in_array($prevNonSpace, ['(', ',', '+', '-', '*', '/', '%', '=', '>', '<', '!', '~'], true)) {
                     return false;
                 }
             }
@@ -406,13 +407,30 @@ class View
                 $lastPlusMinusPos = $i;
             } elseif ($ch === '*' || $ch === '/' || $ch === '%') {
                 $lastMulDivPos = $i;
+            } elseif ($ch === '~') {
+                $lastConcatPos = $i;
             }
             return false;
         });
 
-        if ($lastPlusMinusPos > 0) {
-            return [trim(substr($expr, 0, $lastPlusMinusPos)), $expr[$lastPlusMinusPos], trim(substr($expr, $lastPlusMinusPos + 1))];
+        // Приоритет 1: ~, +, - (одинаковый приоритет, левоассоциативность — берем самый правый)
+        $lastPos = -1;
+        $lastOp = '';
+
+        if ($lastConcatPos > $lastPos) {
+            $lastPos = $lastConcatPos;
+            $lastOp = '.'; // Транслируем ~ в PHP-оператор конкатенации
         }
+        if ($lastPlusMinusPos > $lastPos) {
+            $lastPos = $lastPlusMinusPos;
+            $lastOp = $expr[$lastPlusMinusPos];
+        }
+
+        if ($lastPos > 0) {
+            return [trim(substr($expr, 0, $lastPos)), $lastOp, trim(substr($expr, $lastPos + 1))];
+        }
+
+        // Приоритет 2: *, /, %
         if ($lastMulDivPos > 0) {
             return [trim(substr($expr, 0, $lastMulDivPos)), $expr[$lastMulDivPos], trim(substr($expr, $lastMulDivPos + 1))];
         }
@@ -468,18 +486,21 @@ class View
             throw Template::ioError('Не удалось прочитать шаблон: ' . $templateFile);
         }
 
-        // Удаляем комментарии шаблонизатора {# ... #}
         $content = preg_replace('/\{#.*?#}/s', '', $content);
         $dependencies = [$templateFile => filemtime($templateFile)];
 
         // Обработка наследования {% extends "parent.html" %}
-        if (preg_match('/\{%\s*extends\s+[\'"](.+?)[\'"]\s*%}/', $content, $extendsMatch)) {
+        if (preg_match('/\{%\s*extends\s+[\'"](.+?)[\'"]\s*%}/s', $content, $extendsMatch)) {
             $parentFile = $this->templateDir . ltrim($extendsMatch[1], '/\\');
             $this->assertSafePath($parentFile);
+
             if (file_exists($parentFile)) {
                 $dependencies[$parentFile] = filemtime($parentFile);
                 $parentContent = file_get_contents($parentFile);
-                // Извлекаем блоки из дочернего шаблона
+
+                $parentContent = preg_replace('/\{#.*?#}/s', '', $parentContent);
+
+                // Извлекаем блоки из ДОЧЕРНЕГО шаблона
                 preg_match_all('/\{%\s*block\s+(\w+)\s*%}(.*?)\{%\s*endblock\s*%}/s', $content, $blocks, PREG_SET_ORDER);
                 $childBlocks = [];
                 foreach ($blocks as $block) {
@@ -488,43 +509,60 @@ class View
                     }
                     $childBlocks[$block[1]] = $block[2];
                 }
-                // Заменяем блоки в родительском шаблоне
+
+                // Заменяем блоки в родительском шаблоне содержимым из дочернего
                 foreach ($childBlocks as $name => $blockContent) {
-                    $parentContent = preg_replace('/\{%\s*block\s+' . preg_quote($name, '/') . '\s*%}.*?\{%\s*endblock\s*%}/s', $blockContent, $parentContent);
+                    $parentContent = preg_replace(
+                        '/\{%\s*block\s+' . preg_quote($name, '/') . '\s*%}.*?\{%\s*endblock\s*%}/s',
+                        $blockContent,
+                        $parentContent
+                    );
                 }
+
                 $content = $parentContent;
             }
         }
 
         // Обработка {% include "file.html" with {var: val} %}
-        $content = preg_replace_callback('/\{%\s*include\s+[\'"](.+?)[\'"]\s*(?:with\s+(\{[^%]*\}))?\s*%}/s', function ($matches) use (&$dependencies, $depth) {
-            if ($depth >= self::MAX_INCLUDE_DEPTH) {
-                throw Template::syntaxError('Превышена максимальная глубина вложенности.');
-            }
-            $includedTemplate = $matches[1];
-            $withBlock = isset($matches[2]) ? trim($matches[2]) : '';
-            if ($withBlock !== '' && !$this->isEnclosedIn($withBlock, '{', '}')) {
-                throw Template::syntaxError('Несбалансированные скобки в блоке with.');
-            }
-            $incTemplateFile = $this->templateDir . ltrim($includedTemplate, '/\\');
-            $this->assertSafePath($incTemplateFile);
-            if (!file_exists($incTemplateFile)) {
-                return '<!-- Шаблон ' . htmlspecialchars($includedTemplate) . ' не найден -->';
-            }
-
-            $dependencies[$incTemplateFile] = filemtime($incTemplateFile);
-            $incCacheFile = $this->cacheDir . md5($incTemplateFile) . '.php';
-            if (!file_exists($incCacheFile) || filemtime($incTemplateFile) > filemtime($incCacheFile)) {
-                $this->compile($incTemplateFile, $incCacheFile, $depth + 1);
-            }
-            // Подтягиваем зависимости вложенного шаблона
-            if (file_exists($incCacheFile . '.meta.php')) {
-                foreach (include $incCacheFile . '.meta.php' as $depFile => $depMtime) {
-                    $dependencies[$depFile] = $depMtime;
+        $content = preg_replace_callback(
+            '/\{%\s*include\s+[\'"](.+?)[\'"]\s*(?:with\s+(\{[^%]*}))?\s*%}/s',
+            function ($matches) use (&$dependencies, $depth) {
+                if ($depth >= self::MAX_INCLUDE_DEPTH) {
+                    throw Template::syntaxError('Превышена максимальная глубина вложенности.');
                 }
-            }
-            return $withBlock !== '' ? $this->compileIncludeWith($incCacheFile, $this->parseWithBlock($withBlock)) : '<?php include ' . var_export($incCacheFile, true) . '; ?>';
-        }, $content);
+                $includedTemplate = $matches[1];
+                $withBlock = isset($matches[2]) ? trim($matches[2]) : '';
+
+                if ($withBlock !== '' && !$this->isEnclosedIn($withBlock, '{', '}')) {
+                    throw Template::syntaxError('Несбалансированные скобки в блоке with.');
+                }
+
+                $incTemplateFile = $this->templateDir . ltrim($includedTemplate, '/\\');
+                $this->assertSafePath($incTemplateFile);
+
+                if (!file_exists($incTemplateFile)) {
+                    return '<!-- Шаблон ' . htmlspecialchars($includedTemplate) . ' не найден -->';
+                }
+
+                $dependencies[$incTemplateFile] = filemtime($incTemplateFile);
+                $incCacheFile = $this->cacheDir . md5($incTemplateFile) . '.php';
+
+                if (!file_exists($incCacheFile) || filemtime($incTemplateFile) > filemtime($incCacheFile)) {
+                    $this->compile($incTemplateFile, $incCacheFile, $depth + 1);
+                }
+
+                if (file_exists($incCacheFile . '.meta.php')) {
+                    foreach (include $incCacheFile . '.meta.php' as $depFile => $depMtime) {
+                        $dependencies[$depFile] = $depMtime;
+                    }
+                }
+
+                return $withBlock !== ''
+                    ? $this->compileIncludeWith($incCacheFile, $this->parseWithBlock($withBlock))
+                    : '<?php include ' . var_export($incCacheFile, true) . '; ?>';
+            },
+            $content
+        );
 
         // Компиляция вывода {{ expr }}
         $content = preg_replace_callback('/\{\{\s*(.+?)\s*}}/s', fn($m) => $this->compileOutput(trim($m[1])), $content);
@@ -535,12 +573,22 @@ class View
         $content = preg_replace('/\{%\s*else\s*%}/', '<?php else: ?>', $content);
         $content = preg_replace('/\{%\s*endif\s*%}/', '<?php endif; ?>', $content);
 
-        // Компиляция циклов {% for item in collection %}
-        $content = preg_replace_callback('/\{%\s*for\s+(\w+)\s+in\s+(.+?)\s*%}/s', function ($m) {
+        // Компиляция циклов {% for item in collection %} или {% for key, item in collection %}
+        $content = preg_replace_callback('/\{%\s*for\s+([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*(?:\s*,\s*[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)?)\s+in\s+(.+?)\s*%}/s', function ($m) {
             $phpCollection = $this->compileExpression(trim($m[2]));
-            // Создаем объект $loop с метаданными цикла (index, first, last и т.д.)
-            return '<?php $__collection = (array)' . $phpCollection . '; $__loopIndex = 0; $__loopLength = count($__collection); foreach ($__collection as $' . $m[1] . '): $loop = (object)[\'index\' => $__loopIndex, \'iteration\' => $__loopIndex + 1, \'remaining\' => $__loopLength - $__loopIndex - 1, \'count\' => $__loopLength, \'first\' => $__loopIndex === 0, \'last\' => $__loopIndex === $__loopLength - 1]; $__loopIndex++; ?>';
+            $vars = array_map('trim', explode(',', $m[1]));
+
+            if (count($vars) === 2) {
+                [$keyVar, $valVar] = $vars;
+                $foreachStmt = 'foreach ($__collection as $' . $keyVar . ' => $' . $valVar . ')';
+            } else {
+                $valVar = $vars[0];
+                $foreachStmt = 'foreach ($__collection as $' . $valVar . ')';
+            }
+
+            return '<?php $__collection = (array)' . $phpCollection . '; $__loopIndex = 0; $__loopLength = count($__collection); ' . $foreachStmt . ': $loop = (object)[\'index\' => $__loopIndex, \'iteration\' => $__loopIndex + 1, \'remaining\' => $__loopLength - $__loopIndex - 1, \'count\' => $__loopLength, \'first\' => $__loopIndex === 0, \'last\' => $__loopIndex === $__loopLength - 1]; $__loopIndex++; ?>';
         }, $content);
+
         $content = preg_replace('/\{%\s*endfor\s*%}/', '<?php endforeach; ?>', $content);
 
         // Компиляция присваиваний {% set var = expr %}
@@ -557,26 +605,50 @@ class View
     }
 
     /**
-     * Компилирует выражение вывода с учетом автоэкранирования и фильтров.
+     * Компилирует выражение вывода с учётом автоэкранирования и фильтров.
      */
     private function compileOutput(string $expr): string
     {
         if ($expr === '') {
             return '';
         }
+
+        if (($ternary = $this->splitTernary($expr)) !== null) {
+            $condition  = $this->compileExpression($ternary[0]);
+            $truePart   = $this->compilePipeline($ternary[1]);
+            $falsePart  = $this->compilePipeline($ternary[2]);
+            $result = '(' . $condition . ' ? ' . $truePart . ' : ' . $falsePart . ')';
+
+            // Проверяем, был ли |raw в какой-либо из веток тернарного оператора
+            $isRaw = false;
+            foreach ([$ternary[1], $ternary[2]] as $branch) {
+                foreach ($this->splitByPipe($branch) as $part) {
+                    if (trim($part) === 'raw') {
+                        $isRaw = true;
+                        break 2;
+                    }
+                }
+            }
+
+            return $isRaw
+                ? '<?php echo ' . $result . '; ?>'
+                : '<?php echo \CodeX\View::escape(' . $result . '); ?>';
+        }
+
         $parts = $this->splitByPipe($expr);
-        $baseExpr = array_shift($parts) |> $this->compileExpression(...);
         $isRaw = false;
-        $filterParts = [];
         foreach ($parts as $part) {
             if (trim($part) === 'raw') {
-                $isRaw = true; // Отключаем экранирование
-            } else {
-                $filterParts[] = $part;
+                $isRaw = true;
+                break;
             }
         }
-        $baseExpr = $this->compileFilterChain($baseExpr, $filterParts);
-        return $isRaw ? '<?php echo ' . $baseExpr . '; ?>' : '<?php echo \CodeX\Template\View::escape(' . $baseExpr . '); ?>';
+
+        $result = $this->compilePipeline($expr);
+
+        return $isRaw
+            ? '<?php echo ' . $result . '; ?>'
+            : '<?php echo \CodeX\View::escape(' . $result . '); ?>';
     }
 
     /**
@@ -593,7 +665,7 @@ class View
                     $compiledArgs = implode(', ', $safeParts);
                 }
                 // Вызов статического метода, который делегирует выполнение пользовательскому коллбэку
-                $baseExpr = '\CodeX\Template\View::callFilter($_CODEX_VIEW_ENGINE_, \'' . $m[1] . '\', ' . $baseExpr . ', [' . $compiledArgs . '])';
+                $baseExpr = '\CodeX\View::callFilter($_CODEX_VIEW_ENGINE_, \'' . $m[1] . '\', ' . $baseExpr . ', [' . $compiledArgs . '])';
             } else {
                 throw Template::syntaxError('Некорректный синтаксис фильтра: ' . $filterPart);
             }
@@ -622,7 +694,7 @@ class View
         }
         // Диапазоны (1..10)
         if (str_contains($expr, '..') && ($range = $this->splitByRange($expr)) !== null) {
-            return '\CodeX\Template\View::range(' . $this->compileExpression($range[0]) . ', ' . $this->compileExpression($range[1]) . ')';
+            return '\CodeX\View::range(' . $this->compileExpression($range[0]) . ', ' . $this->compileExpression($range[1]) . ')';
         }
         // Тернарный оператор
         if (($ternary = $this->splitTernary($expr)) !== null) {
@@ -708,17 +780,29 @@ class View
 
         // Операторы вхождения (in, not in)
         if (preg_match('/^(.*?)\s+not\s+in\s+(.*)$/is', $expr, $m)) {
-            return '(!\CodeX\Template\View::contains(' . $this->compileExpression(trim($m[2])) . ', ' . $this->compileExpression(trim($m[1])) . '))';
+            return '(!\CodeX\View::contains(' . $this->compileExpression(trim($m[2])) . ', ' . $this->compileExpression(trim($m[1])) . '))';
         }
         if (preg_match('/^(.*?)\s+in\s+(.*)$/is', $expr, $m)) {
-            return '\CodeX\Template\View::contains(' . $this->compileExpression(trim($m[2])) . ', ' . $this->compileExpression(trim($m[1])) . ')';
+            return '\CodeX\View::contains(' . $this->compileExpression(trim($m[2])) . ', ' . $this->compileExpression(trim($m[1])) . ')';
         }
-        // Проверка на определенность (is defined)
+        // Проверка на определенность (is defined / is not defined)
         if (preg_match('/^(.*?)\s+is\s+not\s+defined$/is', $expr, $m)) {
-            return '(!\CodeX\Template\View::isDefined(' . $this->compileExpression(trim($m[1])) . '))';
+            $inner = trim($m[1]);
+            // Простая переменная → нативный isset() без Warning
+            if (preg_match('/^[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*$/', $inner)) {
+                return '(!isset($' . $inner . '))';
+            }
+            // Сложное выражение → сравнение с null
+            return '(' . $this->compileExpression($inner) . ' === null)';
         }
         if (preg_match('/^(.*?)\s+is\s+defined$/is', $expr, $m)) {
-            return '\CodeX\Template\View::isDefined(' . $this->compileExpression(trim($m[1])) . ')';
+            $inner = trim($m[1]);
+            // Простая переменная → нативный isset() без Warning
+            if (preg_match('/^[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*$/', $inner)) {
+                return 'isset($' . $inner . ')';
+            }
+            // Сложное выражение → сравнение с null
+            return '(' . $this->compileExpression($inner) . ' !== null)';
         }
         // Унарное отрицание
         if (preg_match('/^(?:!|not)\s+(.+)$/is', $expr, $unary)) {
@@ -790,7 +874,7 @@ class View
                 throw Template::syntaxError('Вызов функции \'' . $func[1] . '\' запрещен.');
             }
             $args = trim($func[2]) !== '' ? array_map(fn($a) => $this->compileExpression($a), $this->splitArguments($func[2])) : [];
-            return isset($this->functions[$func[1]]) ? '\CodeX\Template\View::callFunction($_CODEX_VIEW_ENGINE_, \'' . $func[1] . '\', [' . implode(',', $args) . '])' : $func[1] . '(' . implode(',', $args) . ')';
+            return isset($this->functions[$func[1]]) ? '\CodeX\View::callFunction($_CODEX_VIEW_ENGINE_, \'' . $func[1] . '\', [' . implode(',', $args) . '])' : $func[1] . '(' . implode(',', $args) . ')';
         }
 
         // Фильтры без вывода (внутри выражений)
@@ -806,11 +890,16 @@ class View
             return strtolower($expr);
         }
         if (preg_match('/^([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)$/', $expr, $var)) {
-            return '$' . $var[1];
+            return '($' . $var[1] . ' ?? null)';
         }
         // Обращение к свойствам через точку (user.name)
         if (preg_match('/^([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\.(.+)$/', $expr, $dot)) {
-            return '\CodeX\Template\View::resolve($' . $dot[1] . ', [' . implode(',', array_map(static fn($p) => var_export($p, true), explode('.', $dot[2]))) . '])';
+            $varName = $dot[1];
+            $path = explode('.', $dot[2])
+                    |> (static fn($x) => array_map(static fn($p) => var_export($p, true), $x))
+                    |> (static fn($x) => implode(',', $x));
+
+            return '\CodeX\View::resolve($' . $varName . ' ?? null, [' . $path . '])';
         }
         if (preg_match('/^([\'"])(.*)\1$/s', $expr, $str)) {
             return var_export($str[2], true);
@@ -863,7 +952,7 @@ class View
                 $cacheKey = $current::class . '::' . $key;
                 if (!isset(self::$propertyCache[$cacheKey])) {
                     self::$propertyCache[$cacheKey] = property_exists($current, $key)
-                        && new ReflectionProperty($current, $key)->isPublic(); // ← без скобок
+                        && new ReflectionProperty($current, $key)->isPublic();
                 }
 
                 if (self::$propertyCache[$cacheKey]) {
@@ -985,7 +1074,7 @@ class View
         $code = '<?php' . PHP_EOL . '    $__includeOldVars = [];' . PHP_EOL;
         foreach (array_keys($withVars) as $key) {
             $code .= '    $__includeOldVars[' . var_export($key, true) . '] = isset($' . $key . ') ? $' . $key . ' : null;' . PHP_EOL;
-            $code .= '    $__includeHad_' . $key . ' = isset($' . $key . ');' . PHP_EOL;
+            $code .= '    $__includeHad_' . $key . ' = array_key_exists(' . var_export($key, true) . ', get_defined_vars());' . PHP_EOL;
             $code .= '    $' . $key . ' = ' . $withVars[$key] . ';' . PHP_EOL;
         }
         $code .= '    include ' . var_export($cacheFile, true) . ';' . PHP_EOL;
@@ -1093,7 +1182,8 @@ class View
      * Учитывает строковые литералы и вложенные скобки — не путает `:` внутри
      * строки 'd.m.Y H:i' с разделителем тернарного оператора.
      *
-     * @return array{0: string, 1: string, 2: string}|null
+     * @param string $expr
+     * @return array|null {0: string, 1: string, 2: string}|null
      */
     private function splitTernary(string $expr): ?array
     {
@@ -1155,5 +1245,26 @@ class View
         }
 
         return [$condition, $trueBranch, $falseBranch];
+    }
+
+    /**
+     * Компилирует цепочку «выражение | фильтр1 | фильтр2».
+     * Выделено из compileOutput для переиспользования в тернарном операторе.
+     */
+    private function compilePipeline(string $expr): string
+    {
+        $parts = $this->splitByPipe($expr);
+        $baseExpr = array_shift($parts) |> $this->compileExpression(...);
+
+        $filterParts = [];
+        foreach ($parts as $part) {
+            $trimmed = trim($part);
+            if ($trimmed === 'raw') {
+                continue;
+            }
+            $filterParts[] = $part;
+        }
+
+        return $this->compileFilterChain($baseExpr, $filterParts);
     }
 }
